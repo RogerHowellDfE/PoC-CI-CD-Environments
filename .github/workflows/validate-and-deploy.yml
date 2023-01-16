@@ -1,0 +1,96 @@
+name: Deploy Infrastructure
+concurrency: WorkflowConcurrencyKey
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write  ## Need to be able to write the ID token (i.e., ask Azure AD for token and write the response)
+  contents: read   ## Need to be able to read what it creates (i.e., read what was retrieved from Azure AD)
+
+env:
+  ENVIRONMENT_NAME_PREFIX: IaC-CI-CD-PoC
+  AZURE_RESOURCE_GROUP_NAME_PREFIX: IaC-CI-CD-PoC
+  DEPLOYMENT_NAME_PREFIX: "GitHub-Workflow-Run-${{ github.run_number }}" ## Alphanumeric plus .-_ (i.e., `[a-zA-Z0-9.-_]+`)
+  PATH_TO_BICEP_FILE: ./deploy/main.bicep
+
+jobs:
+
+  ## Workaround to pass non-secret env vars to jobs
+  setup_vars:
+    runs-on: ubuntu-latest
+    # Map step output to a job output
+    outputs:
+      AZURE_RESOURCE_GROUP_NAME_PREFIX: ${{ steps.step1.outputs.AZURE_RESOURCE_GROUP_NAME_PREFIX }}
+      DEPLOYMENT_NAME_PREFIX: ${{ steps.step1.outputs.DEPLOYMENT_NAME_PREFIX }}
+      ENVIRONMENT_NAME_PREFIX: ${{ steps.step1.outputs.ENVIRONMENT_NAME_PREFIX }}
+      PATH_TO_BICEP_FILE: ${{ steps.step1.outputs.PATH_TO_BICEP_FILE }}
+    steps:
+      - run: echo ${{ env.PATH_TO_BICEP_FILE }}
+      - name: Set Variables
+        id: step1
+        run: |
+          echo "AZURE_RESOURCE_GROUP_NAME_PREFIX=${{ env.AZURE_RESOURCE_GROUP_NAME_PREFIX }}" >> $GITHUB_OUTPUT
+          echo "DEPLOYMENT_NAME_PREFIX=${{ env.DEPLOYMENT_NAME_PREFIX }}" >> $GITHUB_OUTPUT
+          echo "ENVIRONMENT_NAME_PREFIX=${{ env.ENVIRONMENT_NAME_PREFIX }}" >> $GITHUB_OUTPUT
+          echo "PATH_TO_BICEP_FILE=${{ env.PATH_TO_BICEP_FILE }}" >> $GITHUB_OUTPUT
+      - name: Output Variables
+        run: |
+          echo ${{ steps.step1.outputs.AZURE_RESOURCE_GROUP_NAME_PREFIX }}
+          echo ${{ steps.step1.outputs.DEPLOYMENT_NAME_PREFIX }}
+          echo ${{ steps.step1.outputs.ENVIRONMENT_NAME_PREFIX }}
+          echo ${{ steps.step1.outputs.PATH_TO_BICEP_FILE }}
+
+  ## Fail workflow if error in specifying variables above (i.e., if they're empty string)
+  ## Note: Deliberately a separate job, to validate that variable content is available via job outputs
+  test_var_availability:
+    needs: [setup_vars]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        variableName :
+          - AZURE_RESOURCE_GROUP_NAME_PREFIX
+          - DEPLOYMENT_NAME_PREFIX
+          - ENVIRONMENT_NAME_PREFIX
+          - PATH_TO_BICEP_FILE
+    steps:
+      - name: Variable is set and available via job outputs - needs.setup_vars.outputs.${{ matrix.variableName }}
+        shell: bash
+        run: |
+          if [ "${{ needs.setup_vars.outputs[format('{0}', matrix.variableName)] }}" != '' ]; then
+            echo "${{ matrix.variableName }} is set";
+          else
+            echo >&2 "${{ matrix.variableName }} unavailable";
+            exit 1
+          fi
+
+  deploy:
+    name: deploy to ${{ matrix.environmentType }}
+    needs: [setup_vars, test_var_availability]
+    uses: ./.github/workflows/job-deploy-to-environment.yml
+    strategy:
+      ## Run once for each permutation of matrix options - i.e., once per environment
+      ## - Parallelism limit allows for sequential deployments
+      ## - Fail fast cancels remaining matrix options if any other option fails/errors
+      matrix:
+        environmentType:
+          - sandbox
+          - development
+          - test
+          - preproduction
+          - production
+      max-parallel: 1
+      fail-fast: true
+    with:
+      pathToBicepFile: ${{ needs.setup_vars.outputs.PATH_TO_BICEP_FILE }}
+      environmentNamePrefix: ${{ needs.setup_vars.outputs.ENVIRONMENT_NAME_PREFIX }}
+      environmentType: ${{ matrix.environmentType }}
+      resourceGroupName: ${{ needs.setup_vars.outputs.AZURE_RESOURCE_GROUP_NAME_PREFIX}}-${{ matrix.environmentType }}
+      deploymentName: ${{ needs.setup_vars.outputs.ENVIRONMENT_NAME_PREFIX }}-${{ inputs.environmentType }}             ## Alphanumeric plus .-_ (i.e., `[a-zA-Z0-9.-_]+`)
+    secrets:
+      AZURE_CLIENT_ID: ${{ secrets[format('AZURE_CLIENT_ID_{0}', matrix.variableName)] }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
